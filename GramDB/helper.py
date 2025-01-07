@@ -199,7 +199,7 @@ class EfficientDictQuery:
         :return: A random 10-character ID.
         """
         return ''.join(random.choices(string.ascii_letters + string.digits, k=20))
-                               
+
     async def insert_one(self, table, record, **kwargs):
         """
         Inserts a new record into the given table.
