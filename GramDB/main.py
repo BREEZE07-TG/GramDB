@@ -59,7 +59,7 @@ class GramDB:
                 raise ValueError(f"Authentication failed: Server failed to respond!")
             elif response.status_code != 200:
                 raise ValueError(f"Authentication failed: Unexpected status code {response.status_code}")
-                                                                                  
+
             self.auth = response.json()
             self.token = self.auth['client_id']
             self.url = self.auth['url']
@@ -87,7 +87,7 @@ class GramDB:
                     pass
                 else:
                     all_ids = all_ids + table
-                
+            
             result, all_rows = fetchall_func(self.url, self.token, all_ids)
             if result:
                 for row in all_rows["data"]:
