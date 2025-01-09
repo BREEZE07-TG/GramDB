@@ -34,7 +34,7 @@ class DATABASE:
         self.async_manager = GramDBAsync()
         self.db = GramDB(uri, self.async_manager)
         self.table_schemas = {
-            "users_tab": ("_id", "name")
+            "users2": ("_id", "name")
         }
         self.async_manager.run_async(self.create_table())
 
@@ -48,7 +48,7 @@ class DATABASE:
 
     async def check_user(self, user_id: int):
         data = await self.db.find_one(
-            "users_tab",
+            "users2",
             {
                 "_id": user_id
             }
@@ -65,7 +65,7 @@ class DATABASE:
         else:
             try:
                 await self.db.insert_one(
-                    "users_tab",
+                    "users2",
                     {
                         "_id": user_id,
                         "name": "ishikki"
@@ -86,13 +86,9 @@ class DATABASE:
 
 
 async def main():
-    db = DATABASE("https://blue-api.vercel.app/database?client=gayyy@69696969.gramdb")
+    db = DATABASE("https://blue-api.vercel.app/database?client=123456789&app=alpha@vaishu143.gramdb")
     await db.add_user(99999992)
-    #print("done")
-    #await db.delete_table("users_tab")
-    #print("done")
-    #await asyncio.sleep(5)
-    ##aa = await db.fetch_table("welcome")
+    aa = await db.fetch_table("users2")
     print(aa)
     db.close()
 
