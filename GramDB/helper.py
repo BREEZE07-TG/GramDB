@@ -381,6 +381,36 @@ class EfficientDictQuery:
         await self._update_index_for_record(table, record, record_id, operation='remove')
         del self.data[table][record_id]
         return _m_id
+    
+    async def delete_many(self, table, query):
+        """
+        Deletes multiple records from the given table based on the query.
+
+        :param table: The name of the table to delete from.
+        :param query: A dictionary containing the query criteria.
+        :return: Number of deleted records.
+        """
+        if table not in self.data:
+            raise ValueError(f"Table '{table}' does not exist.")
+        
+        records_to_delete = [
+            record_id for record_id, record in self.data[table].items()
+            if all(record.get(key) == value for key, value in query.items())
+        ]
+        if not records_to_delete:
+            raise ValueError(f"No records found matching query: {query}")
+        count = 0
+        for record_id in records_to_delete:
+            record = self.data[table][record_id]
+
+            # remove from index
+            await self._update_index_for_record(table, record, record_id, operation='remove')
+
+            # delete from data
+            del self.data[table][record_id]
+            count += 1
+
+        return count
 
     async def delete_table(self, table):
         """
