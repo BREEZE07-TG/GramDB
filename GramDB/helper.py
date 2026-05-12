@@ -114,9 +114,7 @@ class EfficientDictQuery:
         results = []
 
         for record_id, record in self.data.get(table, {}).items():
-            if record_id == 'sample1928':
-                continue
-            if all(record.get(key) == value for key, value in query.items()):
+            if self._match_query(record, query):
                 results.append(record)
 
         return results
@@ -226,6 +224,43 @@ class EfficientDictQuery:
 
         self.data[table][_id] = record
         await self._update_index_for_record(table, record, _id, operation='add')
+    
+    async def insert_many(self, table, records, **kwargs):
+        """
+        Inserts multiple records into the given table.
+
+        :param table: The name of the table.
+        :param records: A list of records (dicts).
+        :param kwargs: Must include '_m_id'.
+        :return: List of inserted IDs.
+        """
+
+        _m_id = kwargs.get('_m_id')
+        if not _m_id:
+            raise ValueError("insert_many requires '_m_id'")
+
+        if table not in self.data:
+            raise ValueError(f"Table '{table}' does not exist.")
+
+        inserted_ids = []
+        errors = []
+
+        for record in records:
+            try:
+                # auto-generate _id if missing
+                if '_id' not in record:
+                    record['_id'] = await self._generate_random_id()
+
+                await self.insert_one(table, record, _m_id=_m_id)
+                inserted_ids.append(record['_id'])
+
+            except Exception as e:
+                errors.append({"record": record, "error": str(e)})
+
+        return {
+            "inserted_ids": inserted_ids,
+            "errors": errors
+        }
 
     # deprecated - supports only set
     async def old_update(self, table, query, update_fields):
@@ -295,6 +330,10 @@ class EfficientDictQuery:
             if operator == "$set":
                 # Set values directly
                 new_record.update(updates)
+            
+            elif operator == "$unset":
+                # unSet values directly
+                new_record.pop(updates)
 
             elif operator == "$push":
                 for key, value in updates.items():
@@ -316,6 +355,33 @@ class EfficientDictQuery:
                         new_record[key] += value  # Increment the value
                     else:
                         raise ValueError(f"Cannot increment non-numeric field '{key}'")
+                    
+            elif operator == "$mul":
+                '''multiplies value'''
+                for key, value in updates.items():
+                    if key in new_record and isinstance(new_record[key], (int, float)):
+                        new_record[key] *= value  # multiplies the value
+                    else:
+                        raise ValueError(f"Cannot increment non-numeric field '{key}'")
+                    
+            elif operator == "$addToSet":
+                '''only push if value doesnt exist'''
+                for key, value in updates.items():
+                    if key in new_record and isinstance(new_record[key], list):
+                        if value not in new_record[key]:
+                            new_record[key].append(value)  # Append to the list
+                        else:
+                            raise ValueError(f"unable to push value already existed '{key}'")
+                    else:
+                        raise ValueError(f"Cannot push to non-list field '{key}'")
+            
+            elif operator == "$rename":
+                '''rename a key'''
+                for key, value in updates.items():
+                    if key in new_record:
+                        new_record[value] = new_record.pop(f"{key}")
+                    else:
+                        raise ValueError(f"Key doesn't exists {key}")
 
         await self._validate_record(table, new_record)
 
@@ -324,6 +390,97 @@ class EfficientDictQuery:
         await self._update_index_for_record(table, self.data[table][record_id], record_id, operation='add')
 
         return _m_id, _id
+    
+    async def update_many(self, table, query, update_fields):
+        """
+        Updates multiple records in the given table based on the query.
+        Returns number of updated records.
+        """
+
+        if table not in self.data:
+            raise ValueError(f"Table '{table}' does not exist.")
+
+        records_to_update = [
+            (record_id, record)
+            for record_id, record in self.data[table].items()
+            if self._match_query(record, query)
+        ]
+
+        if not records_to_update:
+            raise ValueError(f"No records found matching query: {query}")
+
+        count = 0
+
+        for record_id, old_record in records_to_update:
+            new_record = old_record.copy()
+
+            for operator, updates in update_fields.items():
+
+                if operator == "$set":
+                    # Set values directly
+                    new_record.update(updates)
+                
+                elif operator == "$unset":
+                    # unSet values directly
+                    new_record.pop(updates)
+
+                elif operator == "$push":
+                    for key, value in updates.items():
+                        if key in new_record and isinstance(new_record[key], list):
+                            new_record[key].append(value)  # Append to the list
+                        else:
+                            raise ValueError(f"Cannot push to non-list field '{key}'")
+
+                elif operator == "$pull":
+                    for key, value in updates.items():
+                        if key in new_record and isinstance(new_record[key], list):
+                            new_record[key] = [item for item in new_record[key] if item != value]  # Remove matching value
+                        else:
+                            raise ValueError(f"Cannot pull from non-list field '{key}'")
+
+                elif operator == "$inc":
+                    for key, value in updates.items():
+                        if key in new_record and isinstance(new_record[key], (int, float)):
+                            new_record[key] += value  # Increment the value
+                        else:
+                            raise ValueError(f"Cannot increment non-numeric field '{key}'")
+                        
+                elif operator == "$mul":
+                    '''multiplies value'''
+                    for key, value in updates.items():
+                        if key in new_record and isinstance(new_record[key], (int, float)):
+                            new_record[key] *= value  # multiplies the value
+                        else:
+                            raise ValueError(f"Cannot increment non-numeric field '{key}'")
+                        
+                elif operator == "$addToSet":
+                    '''only push if value doesnt exist'''
+                    for key, value in updates.items():
+                        if key in new_record and isinstance(new_record[key], list):
+                            if value not in new_record[key]:
+                                new_record[key].append(value)  # Append to the list
+                            else:
+                                raise ValueError(f"unable to push value already existed '{key}'")
+                        else:
+                            raise ValueError(f"Cannot push to non-list field '{key}'")
+                
+                elif operator == "$rename":
+                    '''rename a key'''
+                    for key, value in updates.items():
+                        if key in new_record:
+                            new_record[value] = new_record.pop(f"{key}")
+                        else:
+                            raise ValueError(f"Key doesn't exists {key}")
+
+            await self._validate_record(table, new_record)
+
+            await self._update_index_for_record(table, old_record, record_id, 'remove')
+            self.data[table][record_id] = new_record
+            await self._update_index_for_record(table, new_record, record_id, 'add')
+
+            count += 1
+
+        return count
     
     async def delete_one(self, table, query):
         """
@@ -350,6 +507,36 @@ class EfficientDictQuery:
         await self._update_index_for_record(table, record, record_id, operation='remove')
         del self.data[table][record_id]
         return _m_id
+    
+    async def delete_many(self, table, query):
+        """
+        Deletes multiple records from the given table based on the query.
+
+        :param table: The name of the table to delete from.
+        :param query: A dictionary containing the query criteria.
+        :return: Number of deleted records.
+        """
+        if table not in self.data:
+            raise ValueError(f"Table '{table}' does not exist.")
+        
+        records_to_delete = [
+            record_id for record_id, record in self.data[table].items()
+            if all(record.get(key) == value for key, value in query.items())
+        ]
+        if not records_to_delete:
+            raise ValueError(f"No records found matching query: {query}")
+        count = 0
+        for record_id in records_to_delete:
+            record = self.data[table][record_id]
+
+            # remove from index
+            await self._update_index_for_record(table, record, record_id, operation='remove')
+
+            # delete from data
+            del self.data[table][record_id]
+            count += 1
+
+        return count
 
     async def delete_table(self, table):
         """
