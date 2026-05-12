@@ -295,6 +295,10 @@ class EfficientDictQuery:
             if operator == "$set":
                 # Set values directly
                 new_record.update(updates)
+            
+            elif operator == "$unset":
+                # unSet values directly
+                new_record.pop(updates)
 
             elif operator == "$push":
                 for key, value in updates.items():
@@ -316,6 +320,33 @@ class EfficientDictQuery:
                         new_record[key] += value  # Increment the value
                     else:
                         raise ValueError(f"Cannot increment non-numeric field '{key}'")
+                    
+            elif operator == "$mul":
+                '''multiplies value'''
+                for key, value in updates.items():
+                    if key in new_record and isinstance(new_record[key], (int, float)):
+                        new_record[key] *= value  # multiplies the value
+                    else:
+                        raise ValueError(f"Cannot increment non-numeric field '{key}'")
+                    
+            elif operator == "$addToSet":
+                '''only push if value doesnt exist'''
+                for key, value in updates.items():
+                    if key in new_record and isinstance(new_record[key], list):
+                        if value not in new_record[key]:
+                            new_record[key].append(value)  # Append to the list
+                        else:
+                            raise ValueError(f"unable to push value already existed '{key}'")
+                    else:
+                        raise ValueError(f"Cannot push to non-list field '{key}'")
+            
+            elif operator == "$rename":
+                '''rename a key'''
+                for key, value in updates.items():
+                    if key in new_record:
+                        new_record[value] = new_record.pop(f"{key}")
+                    else:
+                        raise ValueError(f"Key doesn't exists {key}")
 
         await self._validate_record(table, new_record)
 
