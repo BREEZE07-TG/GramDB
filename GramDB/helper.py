@@ -104,18 +104,25 @@ class EfficientDictQuery:
                 self.schemas[table_name] = tuple(schema)
     
     def _match_query(self, record, query):
-        """
-        Advanced query matcher supporting operators like $gt, $lt, $or, etc.
-        """
-
         for key, value in query.items():
 
+            # Logical operators
             if key == "$or":
-                return any(self._match_query(record, q) for q in value)
+                if not any(self._match_query(record, q) for q in value):
+                    return False
+                continue
 
             if key == "$and":
-                return all(self._match_query(record, q) for q in value)
+                if not all(self._match_query(record, q) for q in value):
+                    return False
+                continue
 
+            if key == "$nor":
+                if any(self._match_query(record, q) for q in value):
+                    return False
+                continue
+
+            # Normal field
             record_value = record.get(key)
 
             if isinstance(value, dict):
@@ -132,6 +139,8 @@ class EfficientDictQuery:
                     if op == "$ne" and not (record_value != cond):
                         return False
                     if op == "$in" and not (record_value in cond):
+                        return False
+                    if op == "$nin" and (record_value in cond):
                         return False
 
             else:
