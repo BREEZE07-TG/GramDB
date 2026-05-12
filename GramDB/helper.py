@@ -103,6 +103,43 @@ class EfficientDictQuery:
                     schema.update(record.keys())
                 self.schemas[table_name] = tuple(schema)
     
+    def _match_query(self, record, query):
+        """
+        Advanced query matcher supporting operators like $gt, $lt, $or, etc.
+        """
+
+        for key, value in query.items():
+
+            if key == "$or":
+                return any(self._match_query(record, q) for q in value)
+
+            if key == "$and":
+                return all(self._match_query(record, q) for q in value)
+
+            record_value = record.get(key)
+
+            if isinstance(value, dict):
+                for op, cond in value.items():
+
+                    if op == "$gt" and not (record_value > cond):
+                        return False
+                    if op == "$gte" and not (record_value >= cond):
+                        return False
+                    if op == "$lt" and not (record_value < cond):
+                        return False
+                    if op == "$lte" and not (record_value <= cond):
+                        return False
+                    if op == "$ne" and not (record_value != cond):
+                        return False
+                    if op == "$in" and not (record_value in cond):
+                        return False
+
+            else:
+                if record_value != value:
+                    return False
+
+        return True
+    
     async def fetch(self, table, query):
         """
         Fetches records from a table based on the given query.
