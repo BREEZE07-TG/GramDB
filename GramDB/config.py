@@ -1,3 +1,10 @@
+"""
+GramDB Configuration Utilities.
+
+This file handles parsing of the database URL and extracting registry 
+and client configuration.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

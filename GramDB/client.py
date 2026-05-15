@@ -1,4 +1,9 @@
+"""
+GramDB Core Client Implementation.
+"""
+
 from __future__ import annotations
+
 
 import asyncio
 import logging
@@ -68,6 +73,10 @@ class GramDB:
         return self._connected
 
     async def connect(self, *, client_label: str | None = None) -> None:
+        """
+        Connect to the GramDB registry and initialize storage workers.
+        """
+
         if self._connected:
             raise GramDBError("GramDB client is already connected")
 

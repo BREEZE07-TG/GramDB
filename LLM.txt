@@ -1,77 +1,53 @@
-# GramDB: Technical Deep Dive
+# GramDB Technical Overview
 
-GramDB is a robust, asynchronous NoSQL database system that leverages Telegram channels as its storage backend. It provides a MongoDB-like interface for Python applications, featuring multi-bot worker rotation to bypass rate limits, session management for data integrity, and a centralized registry for metadata.
+GramDB is a distributed, asynchronous NoSQL-like database system that leverages Telegram channels as a cost-effective, persistent "cold storage" backend while maintaining an in-memory "hot cache" for high-performance querying.
 
-## 1. System Architecture
+## Core Architecture
 
-GramDB consists of three primary layers:
-1.  **Registry (Backend API)**: A Quart-based web service that uses MongoDB to track database metadata (channel IDs, API tokens) and manage active sessions (locks).
-2.  **Client (Python Library)**: The main SDK used by developers to interact with the database.
-3.  **Storage (Telegram)**: Private Telegram channels where data is persisted as messages (text or documents).
+### 1. Storage Backend (Telegram)
+- **Private Channels**: Data is stored as messages in private Telegram channels.
+- **Message Protocol**: Each message contains a JSON-serialized record or a batch of operations.
+- **Index Management**: A special "index message" stores the current state of the database structure and pointers to data blocks.
+- **Worker Pool**: To mitigate Telegram's aggressive flood limits, GramDB uses a `PyrogramWorkerPool` that rotates through multiple bot tokens.
 
----
+### 2. Client Library (GramDB)
+- **In-Memory Engine**: Uses `EfficientDictQuery` to provide fast lookups and complex filtering on local data.
+- **Hydration**: On startup, the client fetches all messages from the Telegram channel to populate its local cache.
+- **Persistence Manager**: Handles asynchronous writes. Changes are first recorded in a local Write-Ahead Log (WAL) to ensure data integrity during crashes.
+- **Batching**: Operations are batched before being sent to Telegram to optimize performance and minimize API calls.
 
-## 2. Core Concepts
+### 3. Registry API
+- **Metadata Storage**: Stores mapping between client keys, Telegram channel IDs, and the current index message ID.
+- **Session Leasing**: Ensures that only one "primary" writer is active at a time for a given database, preventing race conditions and index corruption.
+- **Heartbeats**: Active clients must send regular heartbeats to maintain their session lease.
 
-### Databases & Channels
-Each GramDB "database" is mapped to a unique Telegram channel. The `database_url` (e.g., `gramdb://client_key`) is used by the client to fetch channel metadata from the Registry.
+## How it Works (The "GramDB Process")
 
-### Tables & Records
-Data is organized into logical **tables**. Each **record** (row) in a table is stored as an individual message in the Telegram channel.
--   **Small records**: Stored as compact JSON text in the message body.
--   **Large records**: Stored as `.json` file attachments (Telegram documents) if they exceed the 4096-character limit.
+1. **Connection**:
+   - Client contacts the Registry API with a `database_url`.
+   - API returns the Telegram channel ID and the current `index_message_id`.
+   - Client acquires a session lease from the API.
+2. **Hydration**:
+   - Client uses the worker pool to fetch the index message and all data messages from Telegram.
+   - The local `EfficientDictQuery` engine is populated with this data.
+3. **Operations**:
+   - **Reads**: Performed instantly against the in-memory cache.
+   - **Writes**: 
+     - Recorded in local `journal.json` (WAL).
+     - Applied to the in-memory cache.
+     - Enqueued in the `PersistenceManager` for background synchronization to Telegram.
+4. **Synchronization**:
+   - The `PersistenceManager` batches pending changes.
+   - A bot worker sends the batch to the Telegram channel.
+   - If successful, the index message ID is updated in the Registry API.
 
-### The Index Message
-The "brain" of the database is a special **Index Message** stored in the Telegram channel. This message contains a JSON map of all tables and the message IDs of the records they contain. The Registry stores the ID of this index message.
+## Registry API Overview
 
-### Pyrogram Worker Pool
-To avoid Telegram's strict "Flood Wait" limits, GramDB uses a pool of multiple bots. Requests (send, edit, delete, fetch) are distributed across these bots in a round-robin fashion. Every bot token provided must be an administrator in the target Telegram channel.
+The Registry API is a Quart-based web service that acts as a centralized coordinator for multiple GramDB instances.
 
----
-
-## 3. Detailed Workflow
-
-### Connection & Initialization
-1.  **Metadata Fetch**: The client calls the Registry API with its `client_key` to get the `channel_id`, `api_token`, and `index_message_id`.
-2.  **Session Acquisition**: The client acquires a session lock from the Registry using a unique `instance_id`. This prevents multiple clients from writing to the same database simultaneously, avoiding index corruption.
-3.  **Worker Start**: The client initializes the `PyrogramWorkerPool`, starting a Pyrogram client for each bot token.
-4.  **Hydration**:
-    *   The client fetches the **Index Message** from the Telegram channel.
-    *   Using the IDs listed in the index, it fetches all record messages from the channel.
-    *   All records are parsed and loaded into an in-memory query engine (`EfficientDictQuery`).
-5.  **Heartbeat**: A background task sends periodic heartbeats to the Registry to maintain the session lock.
-
-### CRUD Operations
--   **Insert/Create**: 
-    1.  The record is sent to the Telegram channel as a new message.
-    2.  The resulting `message_id` is added to the local Index.
-    3.  The updated Index is written back to the Telegram Index Message.
-    4.  The record is added to the local in-memory engine.
--   **Find/Query**: All queries are executed against the local in-memory engine for blazing-fast performance. No Telegram network calls are needed for read operations after the initial hydration.
--   **Update**: 
-    1.  The record is modified locally.
-    2.  The corresponding Telegram message is edited. (If the edit fails or the content type changes from text to document, the message is replaced, and the Index is updated with the new ID).
--   **Delete**: 
-    1.  The Telegram message is deleted.
-    2.  The ID is removed from the Index.
-    3.  The Index Message is updated on Telegram.
-    4.  The record is removed from the local engine.
-
----
-
-## 4. Components Breakdown
-
--   **`GramDB` (client.py)**: The high-level coordinator. Manages connection, sessions, and provides the CRUD API.
--   **`RegistryClient` (registry/client.py)**: Handles HTTP communication with the Registry API.
--   **`PyrogramWorkerPool` (telegram/pyrogram_pool.py)**: Manages bot rotation, session files, and retries with flood-wait handling.
--   **`TelegramChannelStore` (telegram/channel_store.py)**: Low-level logic for reading/writing/parsing Telegram messages and the Index.
--   **`EfficientDictQuery` (engine/query.py)**: A lightweight engine that implements filtering logic (e.g., `{"name": "Alice"}`) on the local dictionary of records.
--   **`JSONCodec` & `TelegramPayload` (utils/)**: Handles compact JSON serialization and the wrapping of data into Telegram-compatible formats.
-
----
-
-## 5. Security & Reliability
--   **Session Locks**: Only one writer can be active. If a client crashes, the session times out after a configurable interval (default 60s), allowing a new client to take over.
--   **Atomic-like Indexing**: The index message is the single source of truth for the database state.
--   **Retries**: The `run_with_flood_wait_retry` utility ensures that operations don't fail immediately when hitting Telegram limits but instead wait and retry.
--   **Data Integrity**: If the local engine gets out of sync, `_reload_engine_from_channel()` can be called to re-fetch everything from Telegram.
+- **Storage**: Uses MongoDB to persist metadata and session states.
+- **Key Responsibilities**:
+  - Managing database registration (`/admin/databases`).
+  - Serving metadata to clients (`/metadata`).
+  - Handling session concurrency (`/sessions/acquire`, `/sessions/heartbeat`).
+  - Locking databases in case of critical errors or unauthorized access.

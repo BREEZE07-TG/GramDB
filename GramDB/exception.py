@@ -1,4 +1,9 @@
-"""GramDB exception hierarchy (stdlib ``ConnectionError`` is not shadowed)."""
+"""
+GramDB Custom Exceptions.
+
+Defines the core exception classes used across the GramDB library and its 
+interactions with Telegram and the Registry API.
+"""
 
 
 class GramDBError(Exception):

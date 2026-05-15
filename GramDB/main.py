@@ -1,4 +1,9 @@
-"""Backward-compatible re-export; prefer ``from GramDB import GramDB``."""
+"""
+GramDB Main Entry Point.
+
+This file provides backward-compatible re-exports for the GramDB client.
+"""
+
 
 from GramDB.client import GramDB
 
