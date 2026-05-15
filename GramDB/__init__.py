@@ -1,9 +1,27 @@
-__version__ = "2.2.0"
+__version__ = "3.0.0"
 
-from GramDB.main import GramDB
-from GramDB.asyncio import GramDBAsync
+from GramDB.client import GramDB
+from GramDB.exception import (
+    GramDBAuthError,
+    GramDBConnectionError,
+    GramDBDuplicateTableError,
+    GramDBError,
+    GramDBIndexTooLargeError,
+    GramDBNotFoundError,
+    GramDBSessionConflictError,
+    GramDBTelegramError,
+    GramDBValidationError,
+)
 
 __all__ = [
     "GramDB",
-    "GramDBAsync"
+    "GramDBError",
+    "GramDBConnectionError",
+    "GramDBAuthError",
+    "GramDBSessionConflictError",
+    "GramDBTelegramError",
+    "GramDBNotFoundError",
+    "GramDBDuplicateTableError",
+    "GramDBValidationError",
+    "GramDBIndexTooLargeError",
 ]
