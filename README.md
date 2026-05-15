@@ -4,7 +4,7 @@ GramDB is a robust, asynchronous Python database library that uses Telegram chan
 
 [![PyPI version](https://badge.fury.io/py/gramdb.svg)](https://badge.fury.io/py/gramdb)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
-[![License](https://img.shields.io/badge/license-GNU-green.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL-green.svg)](LICENSE)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 ## 🚀 Features
