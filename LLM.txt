@@ -1,0 +1,77 @@
+# GramDB: Technical Deep Dive
+
+GramDB is a robust, asynchronous NoSQL database system that leverages Telegram channels as its storage backend. It provides a MongoDB-like interface for Python applications, featuring multi-bot worker rotation to bypass rate limits, session management for data integrity, and a centralized registry for metadata.
+
+## 1. System Architecture
+
+GramDB consists of three primary layers:
+1.  **Registry (Backend API)**: A Quart-based web service that uses MongoDB to track database metadata (channel IDs, API tokens) and manage active sessions (locks).
+2.  **Client (Python Library)**: The main SDK used by developers to interact with the database.
+3.  **Storage (Telegram)**: Private Telegram channels where data is persisted as messages (text or documents).
+
+---
+
+## 2. Core Concepts
+
+### Databases & Channels
+Each GramDB "database" is mapped to a unique Telegram channel. The `database_url` (e.g., `gramdb://client_key`) is used by the client to fetch channel metadata from the Registry.
+
+### Tables & Records
+Data is organized into logical **tables**. Each **record** (row) in a table is stored as an individual message in the Telegram channel.
+-   **Small records**: Stored as compact JSON text in the message body.
+-   **Large records**: Stored as `.json` file attachments (Telegram documents) if they exceed the 4096-character limit.
+
+### The Index Message
+The "brain" of the database is a special **Index Message** stored in the Telegram channel. This message contains a JSON map of all tables and the message IDs of the records they contain. The Registry stores the ID of this index message.
+
+### Pyrogram Worker Pool
+To avoid Telegram's strict "Flood Wait" limits, GramDB uses a pool of multiple bots. Requests (send, edit, delete, fetch) are distributed across these bots in a round-robin fashion. Every bot token provided must be an administrator in the target Telegram channel.
+
+---
+
+## 3. Detailed Workflow
+
+### Connection & Initialization
+1.  **Metadata Fetch**: The client calls the Registry API with its `client_key` to get the `channel_id`, `api_token`, and `index_message_id`.
+2.  **Session Acquisition**: The client acquires a session lock from the Registry using a unique `instance_id`. This prevents multiple clients from writing to the same database simultaneously, avoiding index corruption.
+3.  **Worker Start**: The client initializes the `PyrogramWorkerPool`, starting a Pyrogram client for each bot token.
+4.  **Hydration**:
+    *   The client fetches the **Index Message** from the Telegram channel.
+    *   Using the IDs listed in the index, it fetches all record messages from the channel.
+    *   All records are parsed and loaded into an in-memory query engine (`EfficientDictQuery`).
+5.  **Heartbeat**: A background task sends periodic heartbeats to the Registry to maintain the session lock.
+
+### CRUD Operations
+-   **Insert/Create**: 
+    1.  The record is sent to the Telegram channel as a new message.
+    2.  The resulting `message_id` is added to the local Index.
+    3.  The updated Index is written back to the Telegram Index Message.
+    4.  The record is added to the local in-memory engine.
+-   **Find/Query**: All queries are executed against the local in-memory engine for blazing-fast performance. No Telegram network calls are needed for read operations after the initial hydration.
+-   **Update**: 
+    1.  The record is modified locally.
+    2.  The corresponding Telegram message is edited. (If the edit fails or the content type changes from text to document, the message is replaced, and the Index is updated with the new ID).
+-   **Delete**: 
+    1.  The Telegram message is deleted.
+    2.  The ID is removed from the Index.
+    3.  The Index Message is updated on Telegram.
+    4.  The record is removed from the local engine.
+
+---
+
+## 4. Components Breakdown
+
+-   **`GramDB` (client.py)**: The high-level coordinator. Manages connection, sessions, and provides the CRUD API.
+-   **`RegistryClient` (registry/client.py)**: Handles HTTP communication with the Registry API.
+-   **`PyrogramWorkerPool` (telegram/pyrogram_pool.py)**: Manages bot rotation, session files, and retries with flood-wait handling.
+-   **`TelegramChannelStore` (telegram/channel_store.py)**: Low-level logic for reading/writing/parsing Telegram messages and the Index.
+-   **`EfficientDictQuery` (engine/query.py)**: A lightweight engine that implements filtering logic (e.g., `{"name": "Alice"}`) on the local dictionary of records.
+-   **`JSONCodec` & `TelegramPayload` (utils/)**: Handles compact JSON serialization and the wrapping of data into Telegram-compatible formats.
+
+---
+
+## 5. Security & Reliability
+-   **Session Locks**: Only one writer can be active. If a client crashes, the session times out after a configurable interval (default 60s), allowing a new client to take over.
+-   **Atomic-like Indexing**: The index message is the single source of truth for the database state.
+-   **Retries**: The `run_with_flood_wait_retry` utility ensures that operations don't fail immediately when hitting Telegram limits but instead wait and retry.
+-   **Data Integrity**: If the local engine gets out of sync, `_reload_engine_from_channel()` can be called to re-fetch everything from Telegram.
