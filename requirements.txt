@@ -1,3 +1,2 @@
-asyncio
-aiohttp
-requests
+aiohttp>=3.9.0
+pyrogram>=2.0.106
