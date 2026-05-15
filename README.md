@@ -1,116 +1,88 @@
-# GramDB
+# GramDB: Telegram-Backed Distributed NoSQL Database
 
-GramDB is a small **async-only** Python library that uses a **private Telegram channel** as durable storage for JSON rows, while keeping **hot read/write paths in plain Python dicts** (table-oriented query helpers). A separate **Quart + MongoDB registry API** hands out channel metadata and enforces **one live client per database** using heartbeats.
+GramDB is a robust, asynchronous Python database library that uses Telegram channels as a persistent storage backend. It combines the ease of use of a NoSQL database with the massive, free storage capacity of Telegram, while maintaining high performance through an in-memory cache and a registry-based session management system.
 
-## Why this shape
+[![PyPI version](https://badge.fury.io/py/gramdb.svg)](https://badge.fury.io/py/gramdb)
+[![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-- **Telegram** gives you effectively unbounded append-only storage for small JSON payloads (with practical limits per message; the client automatically switches to small **document** messages when a row exceeds the safe text size).
-- **In-process dict indexes** keep queries fast once the channel has been hydrated.
-- **Multiple bot tokens** rotate per Telegram call so you share flood limits across workers. **Every bot must be a channel admin** with permission to post (and delete, for row deletes).
-- **Single session**: the registry API issues a lease; a second `GramDB.connect()` for the same database receives **409** and the library raises `GramDBSessionConflictError`.
+## 🚀 Features
 
-## Install
+- **Infinite Cold Storage**: Use private Telegram channels to store gigabytes of data for free.
+- **High Performance**: Reads and complex queries are served from an in-memory "hot cache".
+- **Reliability**: Built-in Write-Ahead Log (WAL) ensures your data isn't lost during crashes.
+- **Concurrency Control**: A Registry API manages session leases to prevent multiple writers from corrupting the index.
+- **Anti-Flood Rotation**: A pool of bot workers automatically rotates tokens to avoid Telegram's API flood limits.
+- **Easy Integration**: Simple MongoDB-like API (`find`, `insert`, `update`, `delete`).
+
+## 🛠 Architecture
+
+- **Client Library (`GramDB`)**: The core logic that runs in your application.
+- **Registry API**: A central service that manages database metadata and sessions.
+- **Storage Backend**: A private Telegram channel where your data lives.
+
+## 📦 Installation
+
+You can install the package directly from PyPI:
 
 ```bash
-pip install -e .
-# Optional (faster crypto for Pyrogram):
-# pip install tgcrypto
+pip install gramdb
 ```
 
-Python **3.10+** is required.
+## 🚦 Quick Start
 
-## Registry API (separate service)
+### 1. Setup the Registry API
+Ensure you have db url from gramdb
 
-The HTTP service lives under `api/` and is **not** installed with the `GramDB` package. See [`api/README.md`](api/README.md) for environment variables, admin provisioning, and how to run it with Quart.
-
-## Database URL
-
-Pass the **full metadata URL** you get from hosting the registry, including the `client` query string (same pattern as older GramDB releases):
-
-```text
-https://your-host.example.com/api/v1/metadata?client=myapp@69696969.gramdb
-```
-
-The legacy path `/api/v1/database?client=...` is also supported by the reference API.
-
-The client derives sibling endpoints (sessions, index registration) from the parent path of that URL (`…/api/v1`).
-
-## Minimal usage
-
+### 2. Connect the Client
 ```python
 import asyncio
-from GramDB import GramDB, GramDBSessionConflictError
-
-DATABASE_URL = "https://your-host/api/v1/metadata?client=myapp@69696969.gramdb"
-BOT_TOKENS = ["123456:AAA...", "123456:BBB..."]  # two or more recommended
+from GramDB import GramDB
 
 async def main():
-    db = GramDB(DATABASE_URL, BOT_TOKENS)
-    try:
-        await db.connect(client_label="worker-1")
-    except GramDBSessionConflictError as exc:
-        print("Another process already connected:", exc.details)
-        return
+    # Registry URL and your bot tokens
+    DB_URL = "http://gramdb/api/v1?client=my_app"
 
-    if not await db.check_table("users"):
-        await db.create_one("users", ["_id", "name"])
+    # Get bot token from t.me/botfather
+    BOT_TOKENS = ["token1", "token2"]
 
-    await db.insert_one("users", {"_id": 1, "name": "Ada"})
-    row = await db.find_one("users", {"_id": 1})
-    print(row)
+    # Get api id and hash from my.telegram.org
+    API_ID=12345678
+    API_HASH="987654321qwerty"
 
-    await db.close()
+    async with GramDB(DB_URL, BOT_TOKENS, api_id=API_ID, api_hash=API_HASH) as db:
+        # Insert a record
+        await db.insert_one("users", {"name": "Alice", "age": 25})
+        
+        # Query records
+        users = await db.find("users", {"name": "Alice"})
+        print(users)
 
 asyncio.run(main())
 ```
 
-Context manager form:
+## 🤝 Contributing
 
-```python
-async with GramDB(DATABASE_URL, BOT_TOKENS) as db:
-    ...
-```
+We welcome contributions! Please see our [CONTRIBUTING.md](CONTRIBUTING.md) for details on how to submit pull requests and our [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for our standards of behavior.
 
-## Operations
+### PR Requirements:
+- Follow PEP 8 coding standards.
+- Add docstrings to all new functions and classes.
+- Ensure all tests pass.
+- Provide a clear description of your changes.
 
-| Method | Purpose |
-|--------|---------|
-| `connect` / `close` | Acquire registry lease, start Pyrogram pool, hydrate cache, start heartbeats |
-| `check_table` | Whether a table exists |
-| `create_one` (`create`) | Create table + placeholder row (matches legacy behaviour) |
-| `insert_one` (`insert`) | Insert row (Telegram send + index update) |
-| `find` (`fetch`) | Query rows (dict operators supported by the engine) |
-| `find_one` | First match |
-| `find_all` | All rows (optional per-table) |
-| `update_one` (`update`) | Operator updates (`$set`, `$inc`, …) then Telegram edit |
-| `delete_one` (`delete`) | Remove row locally and delete Telegram message |
-| `delete_table` | Drop table, delete backing messages, rewrite index |
+## 👨‍💻 Author & Support
 
-`wait_for_background_tasks()` is a no-op compatibility hook; persistence is awaited inline.
+Created and managed by **[ishikki akabane](https://github.com/ishikki-akabane)**.
 
-## Package layout
+- **Telegram Support Group**: [t.me/gramdbsupport](https://t.me/gramdbsupport)
+- **Telegram Update Channel**: [t.me/gramdb](https://t.me/gramdb)
 
-```text
-GramDB/
-  client.py          # async GramDB façade
-  config.py          # database URL parsing
-  registry/client.py # aiohttp calls to the registry
-  telegram/          # Pyrogram worker pool + channel persistence
-  engine/query.py    # in-memory dict engine (EfficientDictQuery)
-  utils/             # JSON helpers, Telegram payload sizing, flood retries
-  exception.py       # typed errors
-api/                 # Quart + MongoDB registry (separate deployable)
-```
+## 📜 License
 
-## Limitations (and how they are handled)
+This project is licensed under the GNU License - see the [LICENSE](LICENSE) file for details.
 
-| Limit | Mitigation |
-|-------|------------|
-| Telegram message size | Rows larger than the safe text window are stored as **documents** with a small header marker |
-| Flood limits | Multiple bot tokens, per-call worker rotation, automatic `FloodWait` backoff |
-| Index message size | The catalog is one JSON message; extremely wide databases may hit the index size ceiling—archive old tables or split logical databases |
-| Crash mid-write | Channel + index updates are ordered defensively; worst case leaves orphan Telegram messages—manual cleanup is possible |
+---
 
-## License
-
-GPL-3.0 (see `LICENSE`).
+Built with ❤️ by [ishikki-akabane](https://github.com/ishikki-akabane) and the GramDB Community.
