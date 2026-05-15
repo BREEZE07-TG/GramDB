@@ -1,20 +1,57 @@
+"""GramDB exception hierarchy (stdlib ``ConnectionError`` is not shadowed)."""
+
+
 class GramDBError(Exception):
-    """Base class for all GramDB related errors."""
+    """Base class for GramDB errors."""
+
     pass
 
-class ConnectionError(GramDBError):
-    """Raised when there is a network connection issue."""
+
+class GramDBConnectionError(GramDBError):
+    """Registry or network connectivity failure."""
+
     pass
 
-class NotFoundError(GramDBError):
-    """Raised when a specific table or record is not found."""
+
+class GramDBAuthError(GramDBError):
+    """Invalid database URL, token, or registry response."""
+
     pass
 
-class DuplicateTableError(GramDBError):
-    """Raised when a table already exists."""
+
+class GramDBSessionConflictError(GramDBError):
+    """Another live GramDB client already holds the singleton session lease."""
+
+    def __init__(self, message: str, *, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details
+
+
+class GramDBTelegramError(GramDBError):
+    """Telegram / Pyrogram operation failure (permissions, channel, flood, etc.)."""
+
     pass
 
-class ValidationError(GramDBError):
-    """Raised when a validation error occurs."""
+
+class GramDBNotFoundError(GramDBError):
+    """Missing table or record."""
+
     pass
 
+
+class GramDBDuplicateTableError(GramDBError):
+    """Table already exists."""
+
+    pass
+
+
+class GramDBValidationError(GramDBError):
+    """Payload or schema validation error."""
+
+    pass
+
+
+class GramDBIndexTooLargeError(GramDBError):
+    """Catalog JSON no longer fits in a single Telegram message."""
+
+    pass
