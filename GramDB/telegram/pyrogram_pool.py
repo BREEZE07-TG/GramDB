@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import tempfile
+import time
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
@@ -11,7 +12,6 @@ from pyrogram import Client
 from pyrogram.enums import ChatMemberStatus
 
 from GramDB.exception import GramDBTelegramError
-from GramDB.utils.retry import run_with_flood_wait_retry
 
 logger = logging.getLogger("GramDB")
 
@@ -36,6 +36,7 @@ class PyrogramWorkerPool:
         self._api_hash = api_hash
         self._tokens = list(dict.fromkeys(bot_tokens))
         self._clients: list[Client] = []
+        self._cooldown_until: list[float] = []
         self._rr = 0
         self._lock = asyncio.Lock()
         self._started = False
@@ -57,6 +58,7 @@ class PyrogramWorkerPool:
                 )
                 await client.start()
                 self._clients.append(client)
+                self._cooldown_until.append(0.0)
                 logger.info("Started Pyrogram worker %s (session dir %s)", i, workdir)
             self._started = True
 
@@ -67,22 +69,63 @@ class PyrogramWorkerPool:
             except Exception:  # noqa: BLE001
                 logger.exception("error stopping pyrogram client")
         self._clients.clear()
+        self._cooldown_until.clear()
         self._started = False
 
-    def _next_client(self) -> Client:
-        c = self._clients[self._rr % len(self._clients)]
-        self._rr += 1
-        return c
+    async def _pick_client(self) -> tuple[Client, int]:
+        while True:
+            now = time.monotonic()
+            if not self._clients:
+                raise RuntimeError("PyrogramWorkerPool is not started")
+            n = len(self._clients)
+            for _ in range(n):
+                idx = self._rr % n
+                self._rr += 1
+                if self._cooldown_until[idx] <= now:
+                    return self._clients[idx], idx
+            soonest = min(self._cooldown_until) if self._cooldown_until else now + 1.0
+            await asyncio.sleep(max(0.5, soonest - now))
 
     async def execute(self, fn: Callable[[Client], Awaitable[T]]) -> T:
+        last_exc: BaseException | None = None
+        for attempt in range(1, 13):
+            client, idx = await self._pick_client()
+            try:
+                return await fn(client)
+            except Exception as e:  # noqa: BLE001
+                name = type(e).__name__
+                if name == "FloodWait":
+                    wait_s = int(getattr(e, "value", 1)) + min(attempt, 5)
+                    self._cooldown_until[idx] = max(self._cooldown_until[idx], time.monotonic() + wait_s)
+                    last_exc = e
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
+
+    async def execute_primary(self, fn: Callable[[Client], Awaitable[T]]) -> T:
         if not self._clients:
             raise RuntimeError("PyrogramWorkerPool is not started")
-        client = self._next_client()
-
-        async def once() -> T:
-            return await fn(client)
-
-        return await run_with_flood_wait_retry(once)
+        last_exc: BaseException | None = None
+        idx = 0
+        for attempt in range(1, 13):
+            now = time.monotonic()
+            wait = self._cooldown_until[idx] - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            client = self._clients[idx]
+            try:
+                return await fn(client)
+            except Exception as e:  # noqa: BLE001
+                name = type(e).__name__
+                if name == "FloodWait":
+                    wait_s = int(getattr(e, "value", 1)) + min(attempt, 5)
+                    self._cooldown_until[idx] = max(self._cooldown_until[idx], time.monotonic() + wait_s)
+                    last_exc = e
+                    continue
+                raise
+        assert last_exc is not None
+        raise last_exc
 
     async def ensure_channel_admin(self, channel_id: int) -> None:
         """

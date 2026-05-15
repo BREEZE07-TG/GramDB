@@ -55,6 +55,7 @@ async def test_api():
                 return
             
             api_token = db_data["api_token"]
+            logger.info("Note: index_message_id is expected to be null until the first GramDB client connects.")
 
         # 3. Get Metadata
         logger.info(f"Fetching metadata for {CLIENT_KEY}")
@@ -62,22 +63,43 @@ async def test_api():
             meta = await resp.json()
             logger.info(f"Metadata: {resp.status} - {meta}")
 
-        # 4. Session: Acquire
+        # 4. Update Index Message ID
+        logger.info("Reporting index message ID")
+        auth_headers = {"Authorization": f"Bearer {api_token}"}
+        payload = {"index_message_id": 123456}
+        async with session.post(f"{API_BASE_URL}/databases/index", json=payload, headers=auth_headers) as resp:
+            res = await resp.json()
+            logger.info(f"Update Index: {resp.status} - {res}")
+
+        # 5. Lock Database
+        logger.info("Locking database")
+        payload = {"reason": "Test locking mechanism"}
+        async with session.post(f"{API_BASE_URL}/databases/lock", json=payload, headers=auth_headers) as resp:
+            res = await resp.json()
+            logger.info(f"Lock Database: {resp.status} - {res}")
+
+        # 6. Admin: Unlock Database
+        logger.info("Unlocking database")
+        payload = {"client_key": CLIENT_KEY}
+        async with session.post(f"{API_BASE_URL}/admin/databases/unlock", json=payload, headers=headers) as resp:
+            res = await resp.json()
+            logger.info(f"Unlock Database: {resp.status} - {res}")
+
+        # 7. Session: Acquire
         instance_id = str(uuid.uuid4())
         logger.info(f"Acquiring session for instance: {instance_id}")
-        auth_headers = {"Authorization": f"Bearer {api_token}"}
         payload = {"instance_id": instance_id, "client_label": "pytest-instance"}
         async with session.post(f"{API_BASE_URL}/sessions/acquire", json=payload, headers=auth_headers) as resp:
             res = await resp.json()
             logger.info(f"Acquire Session: {resp.status} - {res}")
 
-        # 5. Session: Heartbeat
+        # 8. Session: Heartbeat
         logger.info("Sending heartbeat")
         async with session.post(f"{API_BASE_URL}/sessions/heartbeat", json={"instance_id": instance_id}, headers=auth_headers) as resp:
             res = await resp.json()
             logger.info(f"Heartbeat: {resp.status} - {res}")
 
-        # 6. Session: Release
+        # 9. Session: Release
         logger.info("Releasing session")
         async with session.post(f"{API_BASE_URL}/sessions/release", json={"instance_id": instance_id}, headers=auth_headers) as resp:
             logger.info(f"Release Session: {resp.status}")

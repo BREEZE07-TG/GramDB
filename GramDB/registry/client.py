@@ -116,3 +116,24 @@ class RegistryClient:
             if resp.status not in (200, 201):
                 text = await resp.text()
                 raise GramDBAuthError(f"index registration failed ({resp.status}): {text[:500]}")
+
+    async def lock_database(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        api_token: str,
+        reason: str | None = None,
+    ) -> None:
+        url = f"{self._resolved.api_root}/databases/lock"
+        body: dict[str, Any] = {}
+        if reason:
+            body["reason"] = reason
+        async with session.post(
+            url,
+            headers=self._hdr(api_token),
+            json=body,
+            timeout=self._timeout,
+        ) as resp:
+            if resp.status not in (200, 201):
+                text = await resp.text()
+                logger.warning("database lock failed: %s %s", resp.status, text[:200])

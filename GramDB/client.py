@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from typing import Any
 
@@ -10,9 +11,11 @@ import aiohttp
 from GramDB.config import parse_database_url
 from GramDB.engine.query import EfficientDictQuery
 from GramDB.exception import GramDBError, GramDBTelegramError
+from GramDB.persistence import PersistenceManager, SyncOp, WriteAheadLog
 from GramDB.registry.client import RegistryClient
-from GramDB.telegram.channel_store import TelegramChannelStore
+from GramDB.telegram.cold_store_v2 import TelegramColdStoreV2
 from GramDB.telegram.pyrogram_pool import PyrogramWorkerPool
+from GramDB.utils.canonical_json import dumps_canonical
 
 logger = logging.getLogger("GramDB")
 
@@ -43,12 +46,14 @@ class GramDB:
         self._registry = RegistryClient(self._resolved)
 
         self._pool: PyrogramWorkerPool | None = None
-        self._store: TelegramChannelStore | None = None
+        self._cold: TelegramColdStoreV2 | None = None
         self._engine: EfficientDictQuery | None = None
         self._metadata: dict[str, Any] = {}
 
         self._instance_id = str(uuid.uuid4())
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._pm: PersistenceManager | None = None
+        self._wal: WriteAheadLog | None = None
         self._connected = False
         self._write_lock = asyncio.Lock()
 
@@ -80,6 +85,9 @@ class GramDB:
                 raise GramDBError("registry metadata missing api_token")
             api_token = token
 
+            if meta.get("locked"):
+                raise GramDBError(f"database is locked: {meta.get('locked_reason')}")
+
             channel_id = meta.get("channel_id")
             if channel_id is None:
                 raise GramDBError("registry metadata missing channel_id")
@@ -105,18 +113,57 @@ class GramDB:
             await self._pool.start()
             await self._pool.ensure_channel_admin(channel_id)
 
-            self._store = TelegramChannelStore(self._pool, channel_id, index_message_id)
-
             if index_message_id is None:
-                empty = TelegramChannelStore.empty_index()
-                new_mid = await self._store.send_index(empty)
-                self._store.index_message_id = new_mid
+                root_mid = await self._bootstrap_v2_root(channel_id=channel_id, compaction_every=50)
+                index_message_id = root_mid
                 await self._registry.report_index_message_id(
-                    self._http, api_token=api_token, index_message_id=new_mid
+                    self._http, api_token=api_token, index_message_id=root_mid
                 )
-                logger.info("Bootstrapped new GramDB index message id=%s", new_mid)
 
+            assert index_message_id is not None
+            self._cold = TelegramColdStoreV2(self._pool, channel_id, int(index_message_id))
+            try:
+                await self._cold.ensure_root_initialized(compaction_every=50)
+            except Exception:
+                root_mid = await self._bootstrap_v2_root(channel_id=channel_id, compaction_every=50)
+                await self._registry.report_index_message_id(
+                    self._http, api_token=api_token, index_message_id=root_mid
+                )
+                self._cold = TelegramColdStoreV2(self._pool, channel_id, int(root_mid))
+                await self._cold.ensure_root_initialized(compaction_every=50)
+
+            wal_path = os.getenv("GRAMDB_WAL_PATH", os.path.join(os.getcwd(), "journal.json"))
+            self._wal = WriteAheadLog(wal_path)
+
+            async def apply_batch(batch: list[SyncOp]) -> None:
+                assert self._cold is not None
+                ops: list[dict[str, Any]] = []
+                for b in batch:
+                    payload = dict(b.payload or {})
+                    payload["op_id"] = b.op_id
+                    payload["kind"] = b.kind
+                    payload["table"] = b.table
+                    if b.row_uuid is not None:
+                        payload["row_uuid"] = b.row_uuid
+                    ops.append(payload)
+                if not batch:
+                    return
+                try:
+                    assert self._wal is not None
+                    await self._cold.apply_batch(ops, table=batch[0].table, patch=self._wal.patch)
+                except Exception as e:  # noqa: BLE001
+                    msg = str(e)
+                    if "403" in msg or "401" in msg or "Forbidden" in msg or "Unauthorized" in msg:
+                        if self._http and api_token:
+                            await self._registry.lock_database(self._http, api_token=api_token, reason=msg[:200])
+                    raise
+
+            self._pm = PersistenceManager(wal=self._wal, apply_batch=apply_batch, batch_window_ms=200)
+            await self._pm.start()
             await self._hydrate_engine()
+            pending = await self._wal.load_pending()
+            await self._replay_ops_to_hot_cache(pending)
+            await self._pm.recover_from_wal()
 
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(api_token=api_token, interval=hb),
@@ -137,7 +184,11 @@ class GramDB:
             if self._pool:
                 await self._pool.stop()
                 self._pool = None
-            self._store = None
+            if self._pm:
+                await self._pm.stop()
+                self._pm = None
+            self._wal = None
+            self._cold = None
             self._engine = None
             if self._http and not self._http_external:
                 await self._http.close()
@@ -161,33 +212,18 @@ class GramDB:
             logger.exception("heartbeat loop crashed")
 
     async def _hydrate_engine(self) -> None:
-        assert self._store is not None
-        index = await self._store.read_index_dict()
-        tables = index.get("tables") or {}
-        all_ids: list[int] = []
-        for _t, mids in tables.items():
-            if not isinstance(mids, list):
-                continue
-            for mid in mids:
-                try:
-                    all_ids.append(int(mid))
-                except (TypeError, ValueError):
-                    continue
-
+        assert self._cold is not None
+        rows_list = await self._cold.hydrate_all_rows()
         rows: dict[str, dict[str, Any]] = {}
-        messages = await self._store.fetch_messages(all_ids)
-        for msg in messages:
-            if not msg or getattr(msg, "empty", False):
+        for r in rows_list:
+            if not isinstance(r, dict):
                 continue
-            try:
-                row = await self._store.parse_row_message(msg)
-            except Exception:  # noqa: BLE001
-                logger.warning("skipping unreadable message id=%s", getattr(msg, "id", "?"))
+            mid = r.get("_m_id")
+            if not isinstance(mid, str) or not mid:
                 continue
-            mid = str(msg.id)
-            row["_m_id"] = mid
-            rows[mid] = row
-
+            if "_table_" not in r or "_id" not in r:
+                continue
+            rows[mid] = r
         self._engine = EfficientDictQuery(rows)
 
     async def _reload_engine_from_channel(self) -> None:
@@ -199,6 +235,11 @@ class GramDB:
         return self._engine
 
     async def close(self) -> None:
+        if self._pm:
+            await self._pm.flush()
+            await self._pm.stop()
+            self._pm = None
+        self._wal = None
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             try:
@@ -225,7 +266,7 @@ class GramDB:
         if self._http and not self._http_external:
             await self._http.close()
             self._http = None
-        self._store = None
+        self._cold = None
         self._engine = None
         self._connected = False
         logger.info("GramDB closed")
@@ -245,43 +286,56 @@ class GramDB:
     async def create_one(self, table_name: str, schema: list[str] | tuple[str, ...]) -> None:
         async with self._write_lock:
             eng = self._require_engine()
-            assert self._store is not None
             sample_record: dict[str, Any] = {field: "gramdb" for field in schema}
             sample_record["_id"] = "sample1928"
-            sample_record["_table_"] = table_name
-            mid = await self._store.send_row(sample_record)
-
-            def mut(idx: dict[str, Any]) -> None:
-                tables = idx.setdefault("tables", {})
-                if table_name in tables:
-                    raise ValueError(f"Table '{table_name}' already exists.")
-                tables[table_name] = [mid]
-
-            await self._mutate_index(mut)
-            sample_record["_m_id"] = str(mid)
-            if "_table_" in sample_record:
-                del sample_record["_table_"]
-            await eng.create(table_name, schema, sample_record, str(mid))
+            row_uuid = str(uuid.uuid4())
+            sample_record["_m_id"] = row_uuid
+            await eng.create(table_name, schema, dict(sample_record), row_uuid)
+            if not self._pm:
+                raise GramDBError("persistence manager is not running")
+            await self._pm.enqueue(
+                SyncOp(
+                    op_id=str(uuid.uuid4()),
+                    kind="table_create",
+                    table=table_name,
+                    row_uuid=None,
+                    payload={"schema": list(schema)},
+                )
+            )
+            tg_row = dict(sample_record)
+            tg_row["_table_"] = table_name
+            await self._pm.enqueue(
+                SyncOp(
+                    op_id=str(uuid.uuid4()),
+                    kind="row_upsert",
+                    table=table_name,
+                    row_uuid=row_uuid,
+                    payload={"row": tg_row},
+                )
+            )
 
     async def insert_one(self, table_name: str, record: dict[str, Any]) -> None:
         async with self._write_lock:
             eng = self._require_engine()
-            assert self._store is not None
             rec = dict(record)
             if "_id" not in rec:
                 rec["_id"] = await eng._generate_random_id()  # noqa: SLF001
-            rec["_table_"] = table_name
-            mid = await self._store.send_row(rec)
-
-            def mut(idx: dict[str, Any]) -> None:
-                tables = idx.setdefault("tables", {})
-                lst = tables.setdefault(table_name, [])
-                lst.append(mid)
-
-            await self._mutate_index(mut)
-            rec["_m_id"] = str(mid)
-            rec.pop("_table_", None)
-            await eng.insert_one(table_name, rec, _m_id=str(mid))
+            row_uuid = str(uuid.uuid4())
+            await eng.insert_one(table_name, rec, _m_id=row_uuid)
+            rec["_m_id"] = row_uuid
+            if not self._pm:
+                raise GramDBError("persistence manager is not running")
+            tg_row = dict(rec)
+            tg_row["_table_"] = table_name
+            await self._pm.enqueue(
+                SyncOp(
+                    op_id=str(uuid.uuid4()),
+                    kind="row_upsert",
+                    table=table_name,
+                    row_uuid=row_uuid,
+                    payload={"row": tg_row},
+                )
+            )
 
     async def find(self, table_name: str, query: dict[str, Any]) -> list[dict[str, Any]]:
         return await self._require_engine().fetch(table_name, query)
@@ -298,84 +352,67 @@ class GramDB:
     ) -> None:
         async with self._write_lock:
             eng = self._require_engine()
-            assert self._store is not None
-            old_m_id, _old_id = await eng.update_one(table_name, query, update_query)
+            row_uuid, _old_id = await eng.update_one(table_name, query, update_query)
             rows = await eng.fetch(table_name, {"_id": _old_id})
             if not rows:
                 raise GramDBError("failed to read row after update")
             row = dict(rows[0])
-            tg_body = dict(row)
-            tg_body["_table_"] = table_name
-            new_mid = await self._store.edit_row(int(old_m_id), tg_body)
-            if str(new_mid) != str(old_m_id):
-
-                def mut(idx: dict[str, Any]) -> None:
-                    lst = idx.get("tables", {}).get(table_name)
-                    if not isinstance(lst, list):
-                        return
-                    for i, v in enumerate(lst):
-                        if int(v) == int(old_m_id):
-                            lst[i] = new_mid
-                            break
-
-                await self._mutate_index(mut)
-                await self._reload_engine_from_channel()
+            if not self._pm:
+                raise GramDBError("persistence manager is not running")
+            tg_row = dict(row)
+            tg_row["_table_"] = table_name
+            await self._pm.enqueue(
+                SyncOp(
+                    op_id=str(uuid.uuid4()),
+                    kind="row_upsert",
+                    table=table_name,
+                    row_uuid=str(row_uuid),
+                    payload={"row": tg_row},
+                )
+            )
 
     async def delete_one(self, table_name: str, query: dict[str, Any]) -> None:
         async with self._write_lock:
             eng = self._require_engine()
-            assert self._store is not None
             rows = await eng.fetch(table_name, query)
             if not rows:
                 raise ValueError(f"No records found matching query: {query}")
-            m_id = rows[0]["_m_id"]
-            await self._store.delete_row_message(int(m_id))
-
-            def mut(idx: dict[str, Any]) -> None:
-                lst = idx.get("tables", {}).get(table_name)
-                if not isinstance(lst, list):
-                    return
-                idx["tables"][table_name] = [x for x in lst if int(x) != int(m_id)]
-
-            await self._mutate_index(mut)
-            try:
-                await eng.delete_one(table_name, query)
-            except Exception:
-                await self._reload_engine_from_channel()
-                raise
+            record_id = rows[0].get("_id")
+            row_uuid = rows[0].get("_m_id")
+            if not isinstance(record_id, str) or not isinstance(row_uuid, str):
+                raise GramDBError("invalid record metadata for delete")
+            await eng.delete_one(table_name, query)
+            if not self._pm:
+                raise GramDBError("persistence manager is not running")
+            await self._pm.enqueue(
+                SyncOp(
+                    op_id=str(uuid.uuid4()),
+                    kind="row_delete",
+                    table=table_name,
+                    row_uuid=str(row_uuid),
+                    payload={"_id": record_id},
+                )
+            )
 
     async def delete_table(self, table_name: str) -> None:
         async with self._write_lock:
             eng = self._require_engine()
-            assert self._store is not None
-            index = await self._store.read_index_dict()
-            mids = list(index.get("tables", {}).get(table_name) or [])
-            if not isinstance(mids, list):
-                mids = []
-
-            for mid in mids:
-                try:
-                    await self._store.delete_row_message(int(mid))
-                except Exception:  # noqa: BLE001
-                    logger.warning("failed deleting telegram message %s", mid)
-
-            def mut(idx: dict[str, Any]) -> None:
-                if table_name in idx.get("tables", {}):
-                    del idx["tables"][table_name]
-
-            await self._mutate_index(mut)
             await eng.delete_table(table_name)
-
-    async def _mutate_index(self, mutator) -> None:  # noqa: ANN001
-        assert self._store is not None
-        idx = await self._store.read_index_dict()
-        mutator(idx)
-        await self._store.write_index_dict(idx)
+            if not self._pm:
+                raise GramDBError("persistence manager is not running")
+            await self._pm.enqueue(
+                SyncOp(
+                    op_id=str(uuid.uuid4()),
+                    kind="table_drop",
+                    table=table_name,
+                    row_uuid=None,
+                    payload={},
+                )
+            )
 
     async def wait_for_background_tasks(self) -> None:
-        """Compatibility hook; persistence is awaited inline in this version."""
-
-        return
+        if self._pm:
+            await self._pm.flush()
 
     # --- legacy names used in older scripts ---
 
@@ -390,9 +427,60 @@ class GramDB:
         database_url: str,
         bot_tokens: str | list[str],
         *,
+        api_id: int,
+        api_hash: str,
         client_label: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
     ) -> GramDB:
-        g = GramDB(database_url, bot_tokens, http_session=http_session)
+        g = GramDB(database_url, bot_tokens, api_id, api_hash, http_session=http_session)
         await g.connect(client_label=client_label)
         return g
+
+    async def _bootstrap_v2_root(self, *, channel_id: int, compaction_every: int) -> int:
+        assert self._pool is not None
+        root = {"v": 2, "tables": {}, "compaction_every": int(compaction_every)}
+        text = dumps_canonical(root)
+
+        async def work(c):  # noqa: ANN001
+            m = await c.send_message(channel_id, text)
+            return int(m.id)
+
+        return await self._pool.execute_primary(work)
+
+    async def _replay_ops_to_hot_cache(self, ops: list[SyncOp]) -> None:
+        if not ops:
+            return
+        eng = self._require_engine()
+        for op in ops:
+            if op.kind == "row_upsert":
+                row = op.payload.get("row") if isinstance(op.payload, dict) else None
+                if not isinstance(row, dict):
+                    continue
+                table = op.table
+                if row.get("_table_") != table:
+                    continue
+                record_id = row.get("_id")
+                row_uuid = row.get("_m_id")
+                if not isinstance(record_id, str) or not isinstance(row_uuid, str):
+                    continue
+                body = dict(row)
+                body.pop("_table_", None)
+                exists = await eng.fetch(table, {"_id": record_id})
+                if not exists:
+                    try:
+                        await eng.insert_one(table, body, _m_id=row_uuid)
+                    except Exception:
+                        continue
+                else:
+                    try:
+                        await eng.update_one(table, {"_id": record_id}, {"$set": body})
+                    except Exception:
+                        continue
+            elif op.kind == "row_delete":
+                record_id = op.payload.get("_id") if isinstance(op.payload, dict) else None
+                if not isinstance(record_id, str):
+                    continue
+                try:
+                    await eng.delete_one(op.table, {"_id": record_id})
+                except Exception:
+                    continue
