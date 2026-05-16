@@ -49,17 +49,18 @@ class PyrogramWorkerPool:
                 return
             for i, token in enumerate(self._tokens):
                 session = f"gramdb_{i}_{_token_fp(token)}"
-                workdir = tempfile.mkdtemp(prefix="gramdb_session_")
+                # workdir = tempfile.mkdtemp(prefix="gramdb_session_")
                 client = Client(
                     session,
                     bot_token=token,
                     api_id=self._api_id, api_hash=self._api_hash,
-                    workdir=workdir, no_updates=True
+                    no_updates=True,
+                    # workdir=workdir
                 )
                 await client.start()
                 self._clients.append(client)
                 self._cooldown_until.append(0.0)
-                logger.info("Started Pyrogram worker %s (session dir %s)", i, workdir)
+                logger.info("Started Pyrogram worker %s (session dir %s)", i, session)
             self._started = True
 
     async def stop(self) -> None:

@@ -244,8 +244,13 @@ class GramDB:
         return self._engine
 
     async def close(self) -> None:
+        logger.info("Stopping GramDB, please wait...")
         if self._pm:
+            if self._pm.frozen:
+                raise GramDBError(f"cannot flush pending writes: {self._pm.frozen_reason}")
+            logger.info("Flushing pending writes to Telegram...")
             await self._pm.flush()
+            logger.info("Flush complete.")
             await self._pm.stop()
             self._pm = None
         self._wal = None

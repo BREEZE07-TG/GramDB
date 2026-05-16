@@ -39,6 +39,10 @@ class PersistenceManager:
         self._stop_evt = asyncio.Event()
         self._can_run = asyncio.Event()
         self._can_run.set()
+        self._idle_evt = asyncio.Event()
+        self._idle_evt.set()
+        self._state_lock = asyncio.Lock()
+        self._in_flight = 0
 
         self._frozen = False
         self._frozen_reason: str | None = None
@@ -62,6 +66,20 @@ class PersistenceManager:
         self._frozen = False
         self._frozen_reason = None
         self._can_run.set()
+
+    async def _mark_activity(self) -> None:
+        async with self._state_lock:
+            self._idle_evt.clear()
+
+    async def _maybe_mark_idle(self) -> None:
+        async with self._state_lock:
+            if self._in_flight != 0:
+                return
+            if not self._incoming.empty():
+                return
+            if any(not q.empty() for q in self._table_queues.values()):
+                return
+            self._idle_evt.set()
 
     async def start(self) -> None:
         if self._started:
@@ -92,29 +110,32 @@ class PersistenceManager:
             self._table_tasks.pop(k, None)
         self._table_queues.clear()
         self._started = False
+        self._idle_evt.set()
 
     async def enqueue(self, op: SyncOp) -> None:
         if self._frozen:
             raise WriteFrozenError(self._frozen_reason or "writes are frozen")
         await self._wal.append_op(op)
+        await self._mark_activity()
         await self._incoming.put(op)
 
     async def recover_from_wal(self) -> int:
         pending = await self._wal.load_pending()
+        if pending:
+            await self._mark_activity()
         for op in pending:
             await self._incoming.put(op)
         return len(pending)
 
     async def flush(self) -> None:
-        while not self._incoming.empty():
-            await asyncio.sleep(0.05)
-        while any(not q.empty() for q in self._table_queues.values()):
-            await asyncio.sleep(0.05)
+        await self._maybe_mark_idle()
+        await self._idle_evt.wait()
 
     async def _dispatcher_loop(self) -> None:
         try:
             while not self._stop_evt.is_set():
                 op = await self._incoming.get()
+                await self._mark_activity()
                 q = self._table_queues.get(op.table)
                 if q is None:
                     q = asyncio.Queue()
@@ -124,6 +145,7 @@ class PersistenceManager:
                         name=f"gramdb-table-worker:{op.table}",
                     )
                 await q.put(op)
+                await self._maybe_mark_idle()
         except asyncio.CancelledError:
             return
 
@@ -148,6 +170,9 @@ class PersistenceManager:
 
                     while True:
                         try:
+                            async with self._state_lock:
+                                self._in_flight += 1
+                                self._idle_evt.clear()
                             await self._apply_batch(batch)
                             for b in batch:
                                 await self._wal.ack(b.op_id, "done")
@@ -157,7 +182,12 @@ class PersistenceManager:
                             msg = str(e)
                             if "403" in msg or "401" in msg or "Forbidden" in msg or "Unauthorized" in msg:
                                 self.freeze(f"panic: telegram auth failure ({name})")
-                                break
+                                await self._can_run.wait()
+                                continue
                             await asyncio.sleep(0.5)
+                        finally:
+                            async with self._state_lock:
+                                self._in_flight = max(0, self._in_flight - 1)
+                            await self._maybe_mark_idle()
             except asyncio.CancelledError:
                 return
